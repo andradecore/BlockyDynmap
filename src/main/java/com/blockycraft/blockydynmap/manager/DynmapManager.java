@@ -9,9 +9,15 @@ import org.dynmap.markers.MarkerAPI;
 import org.dynmap.markers.MarkerSet;
 import org.bukkit.plugin.Plugin;
 
+import java.awt.Rectangle;
+import java.awt.geom.Area;
+import java.awt.geom.PathIterator;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 public class DynmapManager {
@@ -44,64 +50,127 @@ public class DynmapManager {
         }
     }
 
-    // NOVO: Sincroniza markers, removendo todos que não existem mais e criando apenas os de claims válidas
     public void syncMarkers(List<Claim> claims) {
-        Set<String> currentIds = new HashSet<String>();
+        Map<String, List<Claim>> claimsByOwner = new HashMap<>();
         for (Claim claim : claims) {
-            String id = generateMarkerId(claim);
-            currentIds.add(id);
-            createOrUpdateClaimMarker(claim); // (já lida com update/recriação)
+            String owner = claim.getOwnerName();
+            claimsByOwner.computeIfAbsent(owner, k -> new ArrayList<>()).add(claim);
         }
-        // Remove markers "fantasmas"
+
+        Set<String> currentMarkerIds = new HashSet<>();
+
+        for (Map.Entry<String, List<Claim>> entry : claimsByOwner.entrySet()) {
+            List<Claim> ownerClaims = entry.getValue();
+            if (ownerClaims.isEmpty()) continue;
+
+            Area mergedArea = mergeClaims(ownerClaims);
+
+            Claim representativeClaim = ownerClaims.get(0);
+            String markerId = generateMarkerId(representativeClaim.getOwnerName());
+
+            currentMarkerIds.add(markerId);
+            createOrUpdateClaimMarker(representativeClaim, mergedArea, markerId);
+        }
+
         for (AreaMarker marker : markerSet.getAreaMarkers()) {
-            if (!currentIds.contains(marker.getMarkerID())) {
+            if (!currentMarkerIds.contains(marker.getMarkerID().replaceAll("_[0-9]+$", ""))) {
                 marker.deleteMarker();
             }
         }
     }
 
-    public void createOrUpdateClaimMarker(Claim claim) {
+    public void createOrUpdateClaimMarker(Claim claim, Area area, String markerId) {
         if (markerSet == null || claim == null) return;
-        String markerId = generateMarkerId(claim);
         String worldName = claim.getWorldName();
-        AreaMarker existingMarker = markerSet.findAreaMarker(markerId);
-        if (existingMarker != null) {
-            existingMarker.deleteMarker();
+        // Remove existing markers for this owner
+        for (AreaMarker marker : markerSet.getAreaMarkers()) {
+            if (marker.getMarkerID().startsWith(markerId)) {
+                marker.deleteMarker();
+            }
         }
-        double[] xCorners = { claim.getMinX(), claim.getMaxX() + 1 };
-        double[] zCorners = { claim.getMinZ(), claim.getMaxZ() + 1 };
-        AreaMarker marker = markerSet.createAreaMarker(markerId, "", false, worldName, xCorners, zCorners, false);
-        if (marker == null) {
-            System.out.println("[BlockyDynmap] Erro: Nao foi possivel criar o marcador para o claim: " + claim.getClaimName());
-            return;
+
+        List<double[][]> polygons = convertAreaToPolygons(area);
+
+        for (int i = 0; i < polygons.size(); i++) {
+            double[] xCorners = polygons.get(i)[0];
+            double[] zCorners = polygons.get(i)[1];
+            AreaMarker marker = markerSet.createAreaMarker(markerId + "_" + i, "", false, worldName, xCorners, zCorners, false);
+            if (marker == null) {
+                System.out.println("[BlockyDynmap] Erro: Nao foi possivel criar o marcador para o claim: " + claim.getClaimName());
+                return;
+            }
+            String ownerName = claim.getOwnerName();
+            Faction ownerFaction = plugin.getBlockyFactions().getFactionManager().getPlayerFaction(ownerName);
+            String color, label;
+            if (ownerFaction != null) {
+                color = ownerFaction.getColorHex();
+                label = "§f" + ownerFaction.getTag();
+            } else {
+                color = DEFAULT_COLOR;
+                label = "§f" + ownerName;
+            }
+            StringBuilder description = new StringBuilder();
+            description.append("<b>Dono:</b> ").append(ownerName);
+            if (ownerFaction != null) {
+                description.append("<br/><b>Facção:</b> ").append(ownerFaction.getName());
+            }
+            marker.setLabel(label, true);
+            marker.setDescription(description.toString());
+            int colorInt = Integer.parseInt(color.substring(1), 16);
+            marker.setLineStyle(LINE_WEIGHT, LINE_OPACITY, colorInt);
+            marker.setFillStyle(FILL_OPACITY, colorInt);
         }
-        String ownerName = claim.getOwnerName();
-        Faction ownerFaction = plugin.getBlockyFactions().getFactionManager().getPlayerFaction(ownerName);
-        String color, label;
-        if (ownerFaction != null) {
-            color = ownerFaction.getColorHex();
-            label = "§f" + claim.getClaimName() + " §7(" + ownerFaction.getTag() + ")";
-        } else {
-            color = DEFAULT_COLOR;
-            label = "§f" + claim.getClaimName();
+    }
+
+    private Area mergeClaims(List<Claim> claims) {
+        Area mergedArea = new Area();
+        for (Claim claim : claims) {
+            Rectangle rect = new Rectangle(claim.getMinX(), claim.getMinZ(), claim.getMaxX() - claim.getMinX() + 1, claim.getMaxZ() - claim.getMinZ() + 1);
+            mergedArea.add(new Area(rect));
         }
-        StringBuilder description = new StringBuilder();
-        description.append("<b>Dono:</b> ").append(ownerName);
-        if (ownerFaction != null) {
-            description.append("<br/><b>Facção:</b> ").append(ownerFaction.getName());
+        return mergedArea;
+    }
+
+    private List<double[][]> convertAreaToPolygons(Area area) {
+        List<double[][]> polygons = new ArrayList<>();
+        PathIterator pathIterator = area.getPathIterator(null);
+        List<Double> currentX = new ArrayList<>();
+        List<Double> currentZ = new ArrayList<>();
+        double[] coords = new double[6];
+
+        while (!pathIterator.isDone()) {
+            int type = pathIterator.currentSegment(coords);
+            switch (type) {
+                case PathIterator.SEG_MOVETO:
+                    currentX.clear();
+                    currentZ.clear();
+                    currentX.add(coords[0]);
+                    currentZ.add(coords[1]);
+                    break;
+                case PathIterator.SEG_LINETO:
+                    currentX.add(coords[0]);
+                    currentZ.add(coords[1]);
+                    break;
+                case PathIterator.SEG_CLOSE:
+                    double[] xArray = new double[currentX.size()];
+                    double[] zArray = new double[currentZ.size()];
+                    for (int i = 0; i < currentX.size(); i++) {
+                        xArray[i] = currentX.get(i);
+                        zArray[i] = currentZ.get(i);
+                    }
+                    polygons.add(new double[][]{xArray, zArray});
+                    break;
+            }
+            pathIterator.next();
         }
-        marker.setLabel(label, true);
-        marker.setDescription(description.toString());
-        int colorInt = Integer.parseInt(color.substring(1), 16);
-        marker.setLineStyle(LINE_WEIGHT, LINE_OPACITY, colorInt);
-        marker.setFillStyle(FILL_OPACITY, colorInt);
+        return polygons;
     }
 
     public void cleanup() {
         // Limpeza customizada se necessário
     }
 
-    private String generateMarkerId(Claim claim) {
-        return "claim_" + claim.getOwnerName().toLowerCase(Locale.ROOT) + "_" + claim.getClaimName();
+    private String generateMarkerId(String ownerName) {
+        return "claim_" + ownerName.toLowerCase(Locale.ROOT);
     }
 }
